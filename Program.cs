@@ -16,118 +16,251 @@ class Program
     private static readonly WeightedCallGraph Graph = new();
     private static double LastAvgSampleIntervalMs = 0;
     private static string[] Filters = Array.Empty<string>();
+    private static readonly object _lock = new();
+    private static volatile List<DisplayRow> _rows = new();
+    private static volatile bool _dirty = true;
 
     static int Main(string[] args)
     {
         if (args.Length < 1 || !int.TryParse(args[0], out var pid))
         {
-            Console.WriteLine("Usage: HotMethodsCumulative <pid> [windowSec=2] [topN=50] [filters=foo,bar]");
+            Console.WriteLine("Usage: HotMethodsCumulative <pid> [windowSec=2] [topNLeaves=50] [filters=foo,bar]");
             return 1;
         }
         int windowSec = args.Length >= 2 && int.TryParse(args[1], out var w) ? Math.Max(1, w) : 2;
-        int topN = args.Length >= 3 && int.TryParse(args[2], out var t) ? Math.Max(1, t) : 50;
+        int topNLeaves = args.Length >= 3 && int.TryParse(args[2], out var t) ? Math.Max(1, t) : 50;
         if (args.Length >= 4 && !string.IsNullOrWhiteSpace(args[3]))
             Filters = args[3].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-
 
         var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
-        while (!cts.IsCancellationRequested)
+        Task.Run(() => SamplingLoop(pid, windowSec, topNLeaves, cts.Token), cts.Token);
+        UiLoop(pid, windowSec, topNLeaves, cts.Token);
+        return 0;
+    }
+
+    private static void SamplingLoop(int pid, int windowSec, int topNLeaves, CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
         {
             string? trace = null, etlx = null;
             try
             {
                 trace = CollectWindow(pid, windowSec, requestRundown: true);
-
                 var window = AggregateWindow(trace, out etlx);
-
                 if (window.AvgSampleIntervalMs > 0) LastAvgSampleIntervalMs = window.AvgSampleIntervalMs;
-                var intervalForWindow = LastAvgSampleIntervalMs > 0 ? LastAvgSampleIntervalMs : 1.0; 
+                var intervalMs = LastAvgSampleIntervalMs > 0 ? LastAvgSampleIntervalMs : 1.0;
 
-                IEnumerable<CallGraphNode> windowNodes = window.Nodes.Values;
+                IEnumerable<CallGraphNode> nodes = window.Nodes.Values;
                 if (Filters.Length > 0)
-                    windowNodes = windowNodes.Where(n => MatchesNameOnly(n.Name));
-                foreach (var node in windowNodes)
-                    Graph.AddNodeSamples(node.Name, node.InclusiveSamplesCount, intervalForWindow);
-
-                IEnumerable<CallGraphEdge> windowEdges = window.Edges.Values;
+                    nodes = nodes.Where(n => MatchesNameOnly(n.Name));
+                IEnumerable<CallGraphEdge> edges = window.Edges.Values;
                 if (Filters.Length > 0)
-                    windowEdges = windowEdges.Where(e => MatchesNameOnly(e.Caller) || MatchesNameOnly(e.Callee));
-                foreach (var edge in windowEdges)
-                    Graph.AddEdgeSamples(edge.Caller, edge.Callee, edge.SamplesCount, intervalForWindow);
+                    edges = edges.Where(e => MatchesNameOnly(e.Caller) || MatchesNameOnly(e.Callee));
 
-                RenderSpectre(pid, windowSec, topN, window);
+                lock (_lock)
+                {
+                    foreach (var n in nodes)
+                        Graph.AddNodeSamples(n.Name, n.InclusiveSamplesCount, intervalMs);
+                    foreach (var e in edges)
+                        Graph.AddEdgeSamples(e.Caller, e.Callee, e.SamplesCount, intervalMs);
+                    _rows = BuildFlattened(topNLeaves);
+                    _dirty = true;
+                }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[warn] {ex.GetType().Name}: {ex.Message}");
+                AnsiConsole.MarkupLine($"[red]sampling error:[/] {Escape(ex.Message)}");
             }
             finally
             {
                 TryDelete(trace);
                 TryDelete(etlx);
             }
-
-            while (Console.KeyAvailable)
-            {
-                var k = Console.ReadKey(intercept: true);
-                if (k.Key == ConsoleKey.C)
-                {
-                    Graph.Clear();
-                    LastAvgSampleIntervalMs = 0;
-                    AnsiConsole.Clear();
-                }
-            }
         }
-        return 0;
     }
 
-    private static void RenderSpectre(int pid, int windowSec, int topN, WindowAggregationResult window)
+    private static void UiLoop(int pid, int windowSec, int topNLeaves, CancellationToken token)
+    {
+        int selected = 0;
+        int scroll = 0;
+        List<DisplayRow> snapshot = new();
+        while (!token.IsCancellationRequested)
+        {
+            if (_dirty)
+            {
+                lock (_lock)
+                {
+                    snapshot = _rows;
+                    _dirty = false;
+                }
+                if (selected >= snapshot.Count) selected = Math.Max(0, snapshot.Count - 1);
+                EnsureScroll(ref scroll, selected, snapshot.Count);
+                Render(pid, windowSec, topNLeaves, snapshot, selected, scroll);
+            }
+
+            if (Console.KeyAvailable)
+            {
+                var k = Console.ReadKey(true);
+                switch (k.Key)
+                {
+                    case ConsoleKey.UpArrow:
+                        if (selected > 0) { selected--; EnsureScroll(ref scroll, selected, snapshot.Count); _dirty = true; }
+                        break;
+                    case ConsoleKey.DownArrow:
+                        if (selected < snapshot.Count - 1) { selected++; EnsureScroll(ref scroll, selected, snapshot.Count); _dirty = true; }
+                        break;
+                    case ConsoleKey.PageUp:
+                        { int page = GetUsableRows(); selected = Math.Max(0, selected - page); scroll = Math.Max(0, scroll - page); _dirty = true; }
+                        break;
+                    case ConsoleKey.PageDown:
+                        { int page = GetUsableRows(); selected = Math.Min(snapshot.Count - 1, selected + page); scroll = Math.Min(Math.Max(0, snapshot.Count - page), scroll + page); _dirty = true; }
+                        break;
+                    case ConsoleKey.Home:
+                        selected = 0; scroll = 0; _dirty = true; break;
+                    case ConsoleKey.End:
+                        { int page = GetUsableRows(); selected = Math.Max(0, snapshot.Count - 1); scroll = Math.Max(0, snapshot.Count - page); _dirty = true; }
+                        break;
+                    case ConsoleKey.C:
+                        lock (_lock)
+                        {
+                            Graph.Clear();
+                            LastAvgSampleIntervalMs = 0;
+                            _rows = new();
+                            selected = scroll = 0;
+                            _dirty = true;
+                        }
+                        break;
+                }
+            }
+            Thread.Sleep(30);
+        }
+    }
+
+    private static void EnsureScroll(ref int scroll, int selected, int total)
+    {
+        int usable = GetUsableRows();
+        if (selected < scroll) scroll = selected;
+        if (selected >= scroll + usable) scroll = Math.Max(0, selected - usable + 1);
+        scroll = Math.Min(scroll, Math.Max(0, Math.Max(0, total - usable)));
+    }
+
+    private static int GetUsableRows()
+    {
+        int h; try { h = Console.WindowHeight; } catch { h = 40; }
+        int baseOverhead = 1 + 1 + 1 + 2 + 1 + 1; // =7
+        int overhead = baseOverhead;
+        int usable = h - overhead;
+        if (usable < 5) usable = 5;
+        return usable;
+    }
+
+    private static void Render(int pid, int windowSec, int topNLeaves, List<DisplayRow> rows, int selected, int scroll)
     {
         AnsiConsole.Cursor.Hide();
         AnsiConsole.Clear();
         var filterEsc = Escape(string.Join(", ", Filters));
-        var header = new Rule($"PID={pid} | Window={windowSec}s | Top={topN} | Filters={filterEsc}") { Justification = Justify.Left };
+        var header = new Rule($"PID={pid} | Window={windowSec}s | Leaves={topNLeaves} | Filters={filterEsc}") { Justification = Justify.Left };
         AnsiConsole.Write(header);
-        AnsiConsole.MarkupLine($"[dim]Updated @ {DateTime.Now:HH:mm:ss}[/]");
-
-        if (window.MatchedSamples == 0)
+        AnsiConsole.MarkupLine($"[dim]Updated @ {DateTime.Now:HH:mm:ss} | interval≈{LastAvgSampleIntervalMs:F3} ms | Rows={rows.Count}[/]");
+        AnsiConsole.MarkupLine("[grey]Use ↑↓ PgUp PgDn Home End, 'C' to clear, Ctrl+C to exit[/]");
+    int usable = GetUsableRows();
+        var table = new Table().Border(TableBorder.SimpleHeavy);
+        table.AddColumn("Samples");
+        table.AddColumn("CPU-ms");
+        table.AddColumn("Percent");
+        table.AddColumn("Call Tree (hot leaves)");
+        int methodWidth = GetMethodColumnWidth();
+        foreach (var row in rows.Skip(scroll).Take(usable))
         {
-            AnsiConsole.MarkupLine($"[yellow]No samples matched filters[/] {filterEsc}");
-            if (window.Examples.Count > 0)
-            {
-                var eg = new Table().Border(TableBorder.Rounded).AddColumn("Example frames (unfiltered)");
-                foreach (var ex in window.Examples.Take(8))
-                    eg.AddRow(Escape(ex));
-                AnsiConsole.Write(eg);
-            }
-            return;
+            int idx = rows.IndexOf(row); // acceptable for limited visible range
+            var styleStart = idx == selected ? "[black on yellow]" : string.Empty;
+            var styleEnd = idx == selected ? "[/]" : string.Empty;
+            var indent = new string(' ', row.Depth * 2);
+            var bullet = row.Depth > 0 ? "• " : string.Empty;
+            var plainLabel = indent + bullet + row.Name;
+            if (plainLabel.Length > methodWidth)
+                plainLabel = plainLabel.Substring(0, Math.Max(0, methodWidth - 1)) + "…";
+            var label = Escape(plainLabel);
+            table.AddRow(
+                styleStart + row.Samples.ToString() + styleEnd,
+                styleStart + row.CpuMs.ToString("F1") + styleEnd,
+                styleStart + row.Percent.ToString("F1") + "%" + styleEnd,
+                styleStart + label + styleEnd
+            );
         }
-
-        AnsiConsole.MarkupLine($"[grey](inclusive: parent counts include children; interval≈{LastAvgSampleIntervalMs:F3} ms)[/]");
-
-        var nodeTable = new Table().Border(TableBorder.SimpleHeavy);
-        nodeTable.AddColumn("Samples");
-        nodeTable.AddColumn("CPU-ms");
-        nodeTable.AddColumn("Percent");
-        nodeTable.AddColumn("Method (inclusive)");
-
-        foreach (var node in Graph.Nodes.Values.OrderByDescending(n => n.InclusiveSamplesCount).Take(topN))
-        {
-            double pct = (Graph.TotalCpuMsSum > 0) ? (100.0 * node.CpuMs / Graph.TotalCpuMsSum) : 0.0;
-            nodeTable.AddRow(node.InclusiveSamplesCount.ToString(), node.CpuMs.ToString("F1"), pct.ToString("F1") + "%", Escape(node.Name));
-        }
-        AnsiConsole.Write(nodeTable);
-
-        AnsiConsole.MarkupLine($"[dim]Window stats: matched {window.MatchedSamples} of {window.TotalSamples} samples[/]");
-
-        AnsiConsole.MarkupLine("[dim]Press 'C' to clear cumulative data. Ctrl+C to exit.[/]");
+        AnsiConsole.Write(table);
+        AnsiConsole.MarkupLine($"[dim]Showing {Math.Min(rows.Count, rows.Count == 0 ? 0 : scroll + 1)}-{Math.Min(scroll + usable, rows.Count)} of {rows.Count}[/]");
         AnsiConsole.Cursor.Show();
     }
 
-    private static string Escape(string? v)
-        => string.IsNullOrEmpty(v) ? string.Empty : v.Replace("[", "[[").Replace("]", "]]");
+    private static List<DisplayRow> BuildFlattened(int topNLeaves)
+    {
+        var rows = new List<DisplayRow>();
+        var outgoing = new Dictionary<string, List<(CallGraphEdge edge, CallGraphNode callee)>>();
+        var incoming = new Dictionary<string, List<(CallGraphEdge edge, CallGraphNode caller)>>();
+        foreach (var e in Graph.Edges.Values)
+        {
+            if (!Graph.Nodes.TryGetValue(e.Caller, out var caller) || !Graph.Nodes.TryGetValue(e.Callee, out var callee)) continue;
+            if (!outgoing.TryGetValue(e.Caller, out var outList)) outgoing[e.Caller] = outList = new();
+            outList.Add((e, callee));
+            if (!incoming.TryGetValue(e.Callee, out var inList)) incoming[e.Callee] = inList = new();
+            inList.Add((e, caller));
+        }
+        var leaves = Graph.Nodes.Values.Where(n => !outgoing.ContainsKey(n.Name))
+            .OrderByDescending(n => n.InclusiveSamplesCount)
+            .Take(topNLeaves)
+            .ToList();
+        var printed = new HashSet<string>();
+        foreach (var leaf in leaves)
+        {
+            var path = new List<CallGraphNode>();
+            var current = leaf; int guard = 0;
+            while (current != null && guard++ < 256)
+            {
+                path.Add(current);
+                if (!incoming.TryGetValue(current.Name, out var parents) || parents.Count == 0) break;
+                var chosen = parents
+                    .OrderByDescending(p => p.caller.InclusiveSamplesCount)
+                    .ThenByDescending(p => p.edge.SamplesCount)
+                    .First().caller;
+                if (path.Any(p => p.Name == chosen.Name)) break;
+                current = chosen;
+            }
+            path.Reverse();
+            for (int depth = 0; depth < path.Count; depth++)
+            {
+                var node = path[depth];
+                if (printed.Contains(node.Name)) continue;
+                printed.Add(node.Name);
+                double pct = (Graph.TotalCpuMsSum > 0) ? (100.0 * node.CpuMs / Graph.TotalCpuMsSum) : 0.0;
+                rows.Add(new DisplayRow(node.Name, node.InclusiveSamplesCount, node.CpuMs, pct, depth));
+            }
+        }
+        return rows;
+    }
+
+    private static string Escape(string? v) => string.IsNullOrEmpty(v) ? string.Empty : v.Replace("[", "[[").Replace("]", "]]");
+
+    private static int GetMethodColumnWidth()
+    {
+        int w; try { w = Console.WindowWidth; } catch { w = 120; }
+        // Reserve widths for fixed numeric columns and borders/padding.
+        // Numeric columns target widths: Samples(8), CPU-ms(8), Percent(7)
+        // Add separators/padding fudge factor (~14)
+        int reserved = 8 + 8 + 7 + 14;
+        int method = w - reserved;
+        if (method < 20) method = 20;
+        return method;
+    }
+
+    private static int InitTableMargin()
+    {
+        var env = Environment.GetEnvironmentVariable("DOTSTACK_TABLE_MARGIN");
+        if (int.TryParse(env, out var m) && m >= 0 && m <= 50) return m;
+        return 3;
+    }
 
     static string CollectWindow(int pid, int seconds, bool requestRundown)
     {
@@ -272,6 +405,8 @@ class Program
         catch { /* ignore */ }
     }
 }
+
+internal sealed record DisplayRow(string Name, long Samples, double CpuMs, double Percent, int Depth);
 
 internal sealed class CallGraphNode
 {

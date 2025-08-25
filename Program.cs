@@ -20,6 +20,7 @@ class Program
     private static volatile List<DisplayRow> _rows = new();
     private static volatile bool _dirty = true;
     private static volatile ViewMode _viewMode = ViewMode.BottomUp;
+    private static readonly HashSet<string> _collapsed = new(StringComparer.Ordinal);
     private const int ConsoleOverheadRows = 7; // header + help + footer spacing
     private static double Percent(double cpuMs) => Graph.TotalCpuMsSum > 0 ? 100.0 * cpuMs / Graph.TotalCpuMsSum : 0.0;
     private static bool IsFilteredName(string name) => Filters.Length == 0 || Filters.Any(f => !string.IsNullOrEmpty(f) && name.IndexOf(f, StringComparison.OrdinalIgnoreCase) >= 0);
@@ -115,6 +116,57 @@ class Program
                     case ConsoleKey.DownArrow:
                         if (selected < snapshot.Count - 1) { selected++; EnsureScroll(ref scroll, selected, snapshot.Count); _dirty = true; }
                         break;
+                    case ConsoleKey.LeftArrow:
+                        if (snapshot.Count > 0)
+                        {
+                            var row = snapshot[selected];
+                            lock (_lock)
+                            {
+                                if (!_collapsed.Contains(row.Name))
+                                {
+                                    _collapsed.Add(row.Name);
+                                    _rows = BuildRows(topNLeaves);
+                                    snapshot = _rows;
+                                }
+                                else
+                                {
+                                    int curDepth = row.Depth;
+                                    for (int i = selected - 1; i >= 0; i--)
+                                    {
+                                        if (snapshot[i].Depth < curDepth)
+                                        {
+                                            selected = i;
+                                            break;
+                                        }
+                                    }
+                                }
+                                _dirty = true;
+                            }
+                        }
+                        break;
+                    case ConsoleKey.RightArrow:
+                        if (snapshot.Count > 0)
+                        {
+                            var row = snapshot[selected];
+                            lock (_lock)
+                            {
+                                if (_collapsed.Remove(row.Name))
+                                {
+                                    _rows = BuildRows(topNLeaves);
+                                    snapshot = _rows;
+                                    _dirty = true;
+                                }
+                                else
+                                {
+                                    if (selected + 1 < snapshot.Count && snapshot[selected + 1].Depth == row.Depth + 1)
+                                    {
+                                        selected = selected + 1;
+                                        _dirty = true;
+                                    }
+                                }
+                            }
+                        }
+                        break;
                     case ConsoleKey.PageUp:
                         { int page = GetUsableRows(); selected = Math.Max(0, selected - page); scroll = Math.Max(0, scroll - page); _dirty = true; }
                         break;
@@ -132,6 +184,7 @@ class Program
                             Graph.Clear();
                             LastAvgSampleIntervalMs = 0;
                             _rows = new();
+                            _collapsed.Clear();
                             selected = scroll = 0;
                             _dirty = true;
                         }
@@ -177,7 +230,7 @@ class Program
         var header = new Rule($"PID={pid} | Window={windowSec}s | TopN={topLabel} | Filters={filterEsc} | View={modeLabel}") { Justification = Justify.Left };
         AnsiConsole.Write(header);
         AnsiConsole.MarkupLine($"[dim]Updated @ {DateTime.Now:HH:mm:ss} | interval≈{LastAvgSampleIntervalMs:F3} ms | Rows={rows.Count}[/]");
-        AnsiConsole.MarkupLine("[grey]Use ↑↓ PgUp PgDn Home End, 'C' clear, 'T' toggle view, Ctrl+C exit[/]");
+    AnsiConsole.MarkupLine("[grey]Use ↑↓ PgUp PgDn Home End, ← collapse, → expand, 'C' clear, 'T' toggle view, Ctrl+C exit[/]");
         int usable = GetUsableRows();
         var table = new Table().Border(TableBorder.SimpleHeavy)
             .AddColumn("Samples")
@@ -199,8 +252,13 @@ class Program
                 continue;
             }
             var indent = new string(' ', row.Depth * 2);
-            var bullet = row.Depth > 0 ? "• " : string.Empty;
-            var plainLabel = indent + bullet + row.Name;
+            string marker = string.Empty;
+            if (row.HasChildren)
+            {
+                marker = _collapsed.Contains(row.Name) ? "+ " : "- ";
+            }
+            var bullet = row.Depth > 0 ? string.Empty : string.Empty; // marker replaces bullet
+            var plainLabel = indent + marker + bullet + row.Name;
             if (plainLabel.Length > methodWidth)
                 plainLabel = plainLabel[..Math.Max(0, methodWidth - 1)] + "…";
             var label = Escape(plainLabel);
@@ -221,6 +279,14 @@ class Program
         return _viewMode == ViewMode.BottomUp ? BuildFlattenedBottomUp(topN) : BuildFlattenedTopDown(topN);
     }
 
+    private static bool RowHasChildren(List<DisplayRow> rows, int index)
+    {
+        if (index < 0 || index >= rows.Count) return false;
+        int d = rows[index].Depth;
+        int next = index + 1;
+        return next < rows.Count && rows[next].Depth == d + 1;
+    }
+
     private static List<DisplayRow> BuildFlattenedBottomUp(int topNLeaves)
     {
         var rows = new List<DisplayRow>();
@@ -234,19 +300,31 @@ class Program
         }
         var leavesSeq = Graph.Nodes.Values.Where(n => !hasOutgoing.Contains(n.Name))
             .OrderByDescending(n => n.InclusiveSamplesCount)
+            .ThenBy(n => n.Name, StringComparer.Ordinal)
             .AsEnumerable();
         if (topNLeaves > 0) leavesSeq = leavesSeq.Take(topNLeaves);
         var leaves = leavesSeq.ToList();
 
-        void Recurse(string calleeName, HashSet<string> path, int depth)
+    void Recurse(string calleeName, HashSet<string> path, int depth)
         {
             if (depth > 128) return;
             if (!parentsByCallee.TryGetValue(calleeName, out var parents)) return;
-            foreach (var parent in parents.OrderByDescending(p => p.InclusiveSamplesCount))
+            var orderedParents = parents
+                .Select(p => (Parent: p, Edge: Graph.Edges.TryGetValue((p.Name, calleeName), out var edge) ? edge : null))
+                .Where(t => t.Edge != null)
+                .OrderByDescending(t => t.Edge!.SamplesCount)
+                .ThenBy(t => t.Parent.Name, StringComparer.Ordinal);
+            foreach (var tuple in orderedParents)
             {
+                var parent = tuple.Parent;
+                var edge = tuple.Edge!; // non-null ensured above
                 bool cycle = path.Contains(parent.Name);
-                rows.Add(new DisplayRow(cycle ? parent.Name + " (cycle)" : parent.Name, parent.InclusiveSamplesCount, parent.CpuMs, Percent(parent.CpuMs), depth));
+                long edgeSamples = edge.SamplesCount;
+                double edgeCpuMs = edge.CpuMs;
+        bool parentHasParents = parentsByCallee.ContainsKey(parent.Name) && !cycle;
+        rows.Add(new DisplayRow(cycle ? parent.Name + " (cycle)" : parent.Name, edgeSamples, edgeCpuMs, Percent(edgeCpuMs), depth, parentHasParents));
                 if (cycle) continue;
+        if (_collapsed.Contains(parent.Name)) continue;
                 path.Add(parent.Name);
                 Recurse(parent.Name, path, depth + 1);
                 path.Remove(parent.Name);
@@ -255,8 +333,10 @@ class Program
 
         foreach (var leaf in leaves)
         {
-            rows.Add(new DisplayRow(leaf.Name, leaf.InclusiveSamplesCount, leaf.CpuMs, Percent(leaf.CpuMs), 0));
-            Recurse(leaf.Name, new HashSet<string> { leaf.Name }, 1);
+            bool hasParents = parentsByCallee.ContainsKey(leaf.Name);
+            rows.Add(new DisplayRow(leaf.Name, leaf.InclusiveSamplesCount, leaf.CpuMs, Percent(leaf.CpuMs), 0, hasParents));
+            if (!_collapsed.Contains(leaf.Name))
+                Recurse(leaf.Name, new HashSet<string> { leaf.Name }, 1);
         }
         return rows;
     }
@@ -275,39 +355,49 @@ class Program
             incoming.Add(callee.Name);
         }
 
+        long OutgoingSamples(CallGraphNode n) => outgoing.TryGetValue(n.Name, out var list) ? list.Sum(t => t.edge.SamplesCount) : 0;
         IEnumerable<CallGraphNode> rootQuery = Graph.Nodes.Values.Where(n => !incoming.Contains(n.Name))
-            .OrderByDescending(n => n.InclusiveSamplesCount);
+            .OrderByDescending(n => OutgoingSamples(n))
+            .ThenByDescending(n => n.InclusiveSamplesCount)
+            .ThenBy(n => n.Name, StringComparer.Ordinal);
         if (topN > 0)
             rootQuery = rootQuery.Take(topN);
         var roots = rootQuery.ToList();
         if (roots.Count == 0)
         {
-            IEnumerable<CallGraphNode> fallback = Graph.Nodes.Values.OrderByDescending(n => n.InclusiveSamplesCount);
+            IEnumerable<CallGraphNode> fallback = Graph.Nodes.Values
+                .OrderByDescending(n => OutgoingSamples(n))
+                .ThenByDescending(n => n.InclusiveSamplesCount)
+                .ThenBy(n => n.Name, StringComparer.Ordinal);
             if (topN > 0) fallback = fallback.Take(topN);
             roots = fallback.ToList();
         }
         foreach (var root in roots)
         {
-            TraverseFull(root, 0, new HashSet<string>(), rows, outgoing, depthLimit: 128);
+            TraverseFull(root, null, 0, new HashSet<string>(), rows, outgoing, depthLimit: 128);
         }
         return rows;
     }
 
-    private static void TraverseFull(CallGraphNode node, int depth, HashSet<string> path, List<DisplayRow> rows,
+    private static void TraverseFull(CallGraphNode node, CallGraphEdge? incomingEdge, int depth, HashSet<string> path, List<DisplayRow> rows,
         Dictionary<string, List<(CallGraphEdge edge, CallGraphNode callee)>> outgoing, int depthLimit)
     {
         if (depth > depthLimit) return;
         bool cycle = path.Contains(node.Name);
-        rows.Add(new DisplayRow(cycle ? node.Name + " (cycle)" : node.Name, node.InclusiveSamplesCount, node.CpuMs, Percent(node.CpuMs), depth));
+        long samplesDisplay = incomingEdge?.SamplesCount ?? node.InclusiveSamplesCount;
+        double cpuMsDisplay = incomingEdge?.CpuMs ?? node.CpuMs;
+        bool hasChildren = !cycle && outgoing.TryGetValue(node.Name, out var childList) && childList.Count > 0;
+        rows.Add(new DisplayRow(cycle ? node.Name + " (cycle)" : node.Name, samplesDisplay, cpuMsDisplay, Percent(cpuMsDisplay), depth, hasChildren));
         if (cycle) return;
         path.Add(node.Name);
-        if (outgoing.TryGetValue(node.Name, out var children))
+        if (!_collapsed.Contains(node.Name) && outgoing.TryGetValue(node.Name, out var children))
         {
             foreach (var child in children
                 .OrderByDescending(c => c.callee.InclusiveSamplesCount)
-                .ThenByDescending(c => c.edge.SamplesCount))
+                .ThenByDescending(c => c.edge.SamplesCount)
+                .ThenBy(c => c.callee.Name, StringComparer.Ordinal))
             {
-                TraverseFull(child.callee, depth + 1, path, rows, outgoing, depthLimit);
+                TraverseFull(child.callee, child.edge, depth + 1, path, rows, outgoing, depthLimit);
             }
         }
         path.Remove(node.Name);
@@ -490,7 +580,7 @@ internal static class FrameNameUtil
 }
 
 
-internal sealed record DisplayRow(string Name, long Samples, double CpuMs, double Percent, int Depth);
+internal sealed record DisplayRow(string Name, long Samples, double CpuMs, double Percent, int Depth, bool HasChildren = false);
 
 internal sealed class CallGraphNode
 {

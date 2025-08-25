@@ -20,6 +20,7 @@ class Program
     private static volatile List<DisplayRow> _rows = new();
     private static volatile bool _dirty = true;
     private static readonly HashSet<string> _collapsed = new(StringComparer.Ordinal);
+    private static volatile string? _selectedNode = null; // current focused node for zoom view
     private const int ConsoleOverheadRows = 7; // header + help + footer spacing
     private static double Percent(double cpuMs) => Graph.TotalCpuMsSum > 0 ? 100.0 * cpuMs / Graph.TotalCpuMsSum : 0.0;
     private static bool IsFilteredName(string name) => Filters.Length == 0 || Filters.Any(f => !string.IsNullOrEmpty(f) && name.IndexOf(f, StringComparison.OrdinalIgnoreCase) >= 0);
@@ -184,8 +185,35 @@ class Program
                             LastAvgSampleIntervalMs = 0;
                             _rows = new();
                             _collapsed.Clear();
+                            _selectedNode = null;
                             selected = scroll = 0;
                             _dirty = true;
+                        }
+                        break;
+                    case ConsoleKey.Enter:
+                        if (snapshot.Count > 0)
+                        {
+                            var row = snapshot[selected];
+                            if (!string.IsNullOrEmpty(row.Name))
+                            {
+                                lock (_lock)
+                                {
+                                    _selectedNode = row.Name;
+                                    _rows = BuildRows(topNLeaves);
+                                    selected = 0; scroll = 0; _dirty = true;
+                                }
+                            }
+                        }
+                        break;
+                    case ConsoleKey.Escape:
+                        if (_selectedNode != null)
+                        {
+                            lock (_lock)
+                            {
+                                _selectedNode = null;
+                                _rows = BuildRows(topNLeaves);
+                                selected = 0; scroll = 0; _dirty = true;
+                            }
                         }
                         break;
                 }
@@ -219,7 +247,8 @@ class Program
     var header = new Rule($"PID={pid} | Window={windowSec}s | TopN={topLabel} | Filters={filterEsc}") { Justification = Justify.Left };
         AnsiConsole.Write(header);
         AnsiConsole.MarkupLine($"[dim]Updated @ {DateTime.Now:HH:mm:ss} | interval≈{LastAvgSampleIntervalMs:F3} ms | Rows={rows.Count}[/]");
-    AnsiConsole.MarkupLine("[grey]Use ↑↓ PgUp PgDn Home End, ← collapse, → expand, 'C' clear, Ctrl+C exit[/]");
+    var modeInfo = _selectedNode == null ? "Global view" : $"Zoom: {_selectedNode}";
+    AnsiConsole.MarkupLine($"[grey]{modeInfo} | Enter=select zoom  Esc=exit zoom | ↑↓ PgUp PgDn Home End | ← collapse → expand | C clear | Ctrl+C exit[/]");
         int usable = GetUsableRows();
         var table = new Table().Border(TableBorder.SimpleHeavy)
             .AddColumn("Samples")
@@ -265,6 +294,8 @@ class Program
 
     private static List<DisplayRow> BuildRows(int topN)
     {
+        if (_selectedNode is { Length: >0 } name && Graph.Nodes.ContainsKey(name))
+            return BuildZoomUnified(name, topN);
         return BuildFlattenedByNodeSamples(topN);
     }
 
@@ -295,6 +326,153 @@ class Program
             if (displayed.Contains(root.Name))
                 continue;
             TraverseCallees(root, null, 0, new HashSet<string>(), rows, outgoing, 128, displayed);
+        }
+        return rows;
+    }
+
+    // Unified zoom: callers above focus, focus row, then callees below in one tree
+    private static List<DisplayRow> BuildZoomUnified(string focusName, int topN)
+    {
+        var rows = new List<DisplayRow>();
+        if (!Graph.Nodes.TryGetValue(focusName, out var focus)) return rows;
+
+        // Build maps
+        var parentsByCallee = new Dictionary<string, List<(CallGraphEdge edge, CallGraphNode parent)>>();
+        var outgoing = new Dictionary<string, List<(CallGraphEdge edge, CallGraphNode callee)>>();
+        foreach (var e in Graph.Edges.Values)
+        {
+            if (!outgoing.TryGetValue(e.Caller.Name, out var outList)) outgoing[e.Caller.Name] = outList = new();
+            outList.Add((e, e.Callee));
+            if (!parentsByCallee.TryGetValue(e.Callee.Name, out var inList)) parentsByCallee[e.Callee.Name] = inList = new();
+            inList.Add((e, e.Caller));
+        }
+
+        // Gather ancestors reachable to focus
+        var ancestorSet = new HashSet<string>(StringComparer.Ordinal);
+        var stack = new Stack<string>();
+        stack.Push(focusName);
+        while (stack.Count > 0)
+        {
+            var cur = stack.Pop();
+            if (!parentsByCallee.TryGetValue(cur, out var ps)) continue;
+            foreach (var p in ps)
+            {
+                if (ancestorSet.Add(p.parent.Name)) stack.Push(p.parent.Name);
+            }
+        }
+
+        // Determine ancestor roots (no parents in ancestorSet)
+        var ancestorRoots = ancestorSet.Where(a =>
+            !parentsByCallee.TryGetValue(a, out var ps) || ps.All(p => !ancestorSet.Contains(p.parent.Name)))
+            .Select(a => Graph.Nodes[a])
+            .OrderByDescending(n => n.InclusiveSamplesCount)
+            .ThenBy(n => n.Name, StringComparer.Ordinal)
+            .ToList();
+
+        // Helper: does a node lead to focus through ancestors only?
+        var memoLeads = new Dictionary<string, bool>(StringComparer.Ordinal);
+        bool LeadsToFocus(string name)
+        {
+            if (name == focusName) return true;
+            if (memoLeads.TryGetValue(name, out var v)) return v;
+            // Provisional value to break cycles: assume false until proven true
+            memoLeads[name] = false;
+            if (outgoing.TryGetValue(name, out var outs))
+            {
+                foreach (var c in outs)
+                {
+                    var childName = c.callee.Name;
+                    if (childName == focusName || ancestorSet.Contains(childName))
+                    {
+                        if (LeadsToFocus(childName)) { memoLeads[name] = true; break; }
+                    }
+                }
+            }
+            return memoLeads[name];
+        }
+
+        // Build caller side (excluding focus) depths starting at 0
+        var callerRows = new List<DisplayRow>();
+        int maxCallerDepth = -1;
+        void TraverseAncestors(CallGraphNode node, int depth, HashSet<string> path)
+        {
+            if (depth > 64) return;
+            if (node.Name == focusName)
+            {
+                if (depth - 1 > maxCallerDepth) maxCallerDepth = depth - 1;
+                return; // don't add focus in callers section
+            }
+            bool cycle = path.Contains(node.Name);
+            bool hasPathChild = false;
+            if (!cycle && outgoing.TryGetValue(node.Name, out var outs))
+            {
+                foreach (var c in outs)
+                {
+                    if (c.callee.Name == focusName || ancestorSet.Contains(c.callee.Name))
+                    {
+                        if (LeadsToFocus(c.callee.Name)) { hasPathChild = true; break; }
+                    }
+                }
+            }
+            callerRows.Add(new DisplayRow(cycle ? node.Name + " (cycle)" : node.Name, node.InclusiveSamplesCount, node.CpuMs, Percent(node.CpuMs), depth, hasPathChild));
+            if (cycle) return;
+            path.Add(node.Name);
+            if (outgoing.TryGetValue(node.Name, out var children))
+            {
+                foreach (var child in children
+                    .OrderByDescending(c => c.edge.SamplesCount)
+                    .ThenBy(c => c.callee.Name, StringComparer.Ordinal))
+                {
+                    if (child.callee.Name == focusName || ancestorSet.Contains(child.callee.Name))
+                    {
+                        if (LeadsToFocus(child.callee.Name))
+                            TraverseAncestors(child.callee, depth + 1, path);
+                    }
+                }
+            }
+            path.Remove(node.Name);
+        }
+
+        foreach (var root in ancestorRoots)
+            TraverseAncestors(root, 0, new HashSet<string>());
+
+        // Focus depth is maxCallerDepth + 1
+        int focusDepth = maxCallerDepth + 1;
+        // Adjust nothing (callers start at 0 already), we just insert focus row after callers section.
+        rows.AddRange(callerRows);
+
+        bool focusHasChildren = outgoing.TryGetValue(focusName, out var focusOuts) && focusOuts.Count > 0;
+        rows.Add(new DisplayRow(focusName, focus.InclusiveSamplesCount, focus.CpuMs, Percent(focus.CpuMs), focusDepth, focusHasChildren));
+
+        // Callees side
+        void TraverseCalleesLocal(CallGraphNode node, int depth, HashSet<string> path)
+        {
+            if (depth > 128) return;
+            bool cycle = path.Contains(node.Name);
+            bool hasChildren = !cycle && outgoing.TryGetValue(node.Name, out var list) && list.Count > 0;
+            if (node.Name != focusName) // focus already added
+                rows.Add(new DisplayRow(cycle ? node.Name + " (cycle)" : node.Name, node.InclusiveSamplesCount, node.CpuMs, Percent(node.CpuMs), depth, hasChildren));
+            if (cycle) return;
+            path.Add(node.Name);
+            if (!_collapsed.Contains(node.Name) && outgoing.TryGetValue(node.Name, out var outs))
+            {
+                foreach (var c in outs
+                    .OrderByDescending(c => c.edge.SamplesCount)
+                    .ThenBy(c => c.callee.Name, StringComparer.Ordinal))
+                {
+                    TraverseCalleesLocal(c.callee, depth + 1, path);
+                }
+            }
+            path.Remove(node.Name);
+        }
+        if (!_collapsed.Contains(focusName) && focusHasChildren)
+        {
+            foreach (var c in focusOuts!
+                .OrderByDescending(c => c.edge.SamplesCount)
+                .ThenBy(c => c.callee.Name, StringComparer.Ordinal))
+            {
+                TraverseCalleesLocal(c.callee, focusDepth + 1, new HashSet<string> { focusName });
+            }
         }
         return rows;
     }

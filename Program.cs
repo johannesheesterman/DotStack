@@ -19,6 +19,7 @@ class Program
     private static readonly object _lock = new();
     private static volatile List<DisplayRow> _rows = new();
     private static volatile bool _dirty = true;
+    private static volatile ViewMode _viewMode = ViewMode.BottomUp;
 
     static int Main(string[] args)
     {
@@ -65,7 +66,7 @@ class Program
                         Graph.AddNodeSamples(n.Name, n.InclusiveSamplesCount, intervalMs);
                     foreach (var e in edges)
                         Graph.AddEdgeSamples(e.Caller, e.Callee, e.SamplesCount, intervalMs);
-                    _rows = BuildFlattened(topNLeaves);
+                    _rows = BuildRows(topNLeaves);
                     _dirty = true;
                 }
             }
@@ -132,6 +133,15 @@ class Program
                             _dirty = true;
                         }
                         break;
+                    case ConsoleKey.T:
+                        lock (_lock)
+                        {
+                            _viewMode = _viewMode == ViewMode.BottomUp ? ViewMode.TopDown : ViewMode.BottomUp;
+                            _rows = BuildRows(topNLeaves);
+                            selected = scroll = 0;
+                            _dirty = true;
+                        }
+                        break;
                 }
             }
             Thread.Sleep(30);
@@ -161,10 +171,11 @@ class Program
         AnsiConsole.Cursor.Hide();
         AnsiConsole.Clear();
         var filterEsc = Escape(string.Join(", ", Filters));
-        var header = new Rule($"PID={pid} | Window={windowSec}s | Leaves={topNLeaves} | Filters={filterEsc}") { Justification = Justify.Left };
+    var modeLabel = _viewMode == ViewMode.BottomUp ? "BottomUp" : "TopDown";
+    var header = new Rule($"PID={pid} | Window={windowSec}s | TopN={topNLeaves} | Filters={filterEsc} | View={modeLabel}") { Justification = Justify.Left };
         AnsiConsole.Write(header);
         AnsiConsole.MarkupLine($"[dim]Updated @ {DateTime.Now:HH:mm:ss} | interval≈{LastAvgSampleIntervalMs:F3} ms | Rows={rows.Count}[/]");
-        AnsiConsole.MarkupLine("[grey]Use ↑↓ PgUp PgDn Home End, 'C' to clear, Ctrl+C to exit[/]");
+    AnsiConsole.MarkupLine("[grey]Use ↑↓ PgUp PgDn Home End, 'C' clear, 'T' toggle view, Ctrl+C exit[/]");
     int usable = GetUsableRows();
         var table = new Table().Border(TableBorder.SimpleHeavy);
         table.AddColumn("Samples");
@@ -195,7 +206,12 @@ class Program
         AnsiConsole.Cursor.Show();
     }
 
-    private static List<DisplayRow> BuildFlattened(int topNLeaves)
+    private static List<DisplayRow> BuildRows(int topN)
+    {
+        return _viewMode == ViewMode.BottomUp ? BuildFlattenedBottomUp(topN) : BuildFlattenedTopDown(topN);
+    }
+
+    private static List<DisplayRow> BuildFlattenedBottomUp(int topNLeaves)
     {
         var rows = new List<DisplayRow>();
         var outgoing = new Dictionary<string, List<(CallGraphEdge edge, CallGraphNode callee)>>();
@@ -239,6 +255,52 @@ class Program
             }
         }
         return rows;
+    }
+
+    private static List<DisplayRow> BuildFlattenedTopDown(int topN)
+    {
+        var rows = new List<DisplayRow>();
+        var outgoing = new Dictionary<string, List<(CallGraphEdge edge, CallGraphNode callee)>>();
+        var incoming = new HashSet<string>();
+        foreach (var e in Graph.Edges.Values)
+        {
+            if (!Graph.Nodes.TryGetValue(e.Caller, out var caller) || !Graph.Nodes.TryGetValue(e.Callee, out var callee)) continue;
+            if (!outgoing.TryGetValue(e.Caller, out var list)) outgoing[e.Caller] = list = new();
+            list.Add((e, callee));
+            incoming.Add(e.Callee);
+        }
+
+        var roots = Graph.Nodes.Values.Where(n => !incoming.Contains(n.Name))
+            .OrderByDescending(n => n.InclusiveSamplesCount)
+            .Take(topN)
+            .ToList();
+        if (roots.Count == 0)
+        {
+            roots = Graph.Nodes.Values.OrderByDescending(n => n.InclusiveSamplesCount).Take(topN).ToList();
+        }
+        var printed = new HashSet<string>();
+        foreach (var root in roots)
+        {
+            Traverse(root, 0, printed, rows, outgoing, depthLimit: 128);
+        }
+        return rows;
+    }
+
+    private static void Traverse(CallGraphNode node, int depth, HashSet<string> printed, List<DisplayRow> rows,
+        Dictionary<string, List<(CallGraphEdge edge, CallGraphNode callee)>> outgoing, int depthLimit)
+    {
+        if (depth > depthLimit) return;
+        if (printed.Contains(node.Name)) return; // avoid repetition & cycles
+        printed.Add(node.Name);
+        double pct = (Graph.TotalCpuMsSum > 0) ? (100.0 * node.CpuMs / Graph.TotalCpuMsSum) : 0.0;
+        rows.Add(new DisplayRow(node.Name, node.InclusiveSamplesCount, node.CpuMs, pct, depth));
+        if (!outgoing.TryGetValue(node.Name, out var children)) return;
+        foreach (var child in children
+            .OrderByDescending(c => c.callee.InclusiveSamplesCount)
+            .ThenByDescending(c => c.edge.SamplesCount))
+        {
+            Traverse(child.callee, depth + 1, printed, rows, outgoing, depthLimit);
+        }
     }
 
     private static string Escape(string? v) => string.IsNullOrEmpty(v) ? string.Empty : v.Replace("[", "[[").Replace("]", "]]");
@@ -496,4 +558,10 @@ internal sealed class WeightedCallGraph
         TotalCpuMsSum = 0;
         TotalEdgeCpuMsSum = 0;
     }
+}
+
+internal enum ViewMode
+{
+    BottomUp,
+    TopDown
 }

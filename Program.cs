@@ -9,6 +9,7 @@ using Microsoft.Diagnostics.Tracing;
 using Microsoft.Diagnostics.Tracing.Etlx;
 using Microsoft.Diagnostics.Tracing.EventPipe;
 using Microsoft.Diagnostics.Tracing.Parsers;
+using Spectre.Console;
 
 class Program
 {
@@ -28,10 +29,6 @@ class Program
         if (args.Length >= 4 && !string.IsNullOrWhiteSpace(args[3]))
             Filters = args[3].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
-        Console.WriteLine($"PID={pid}, window={windowSec}s, topN={topN}, filters=[{string.Join(", ", Filters)}]");
-        Console.WriteLine("Press Ctrl+C to stop. Press 'C' to clear cumulative data.");
-
-        TryInitFullScreen();
 
         var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
@@ -60,45 +57,7 @@ class Program
                 foreach (var edge in windowEdges)
                     Graph.AddEdgeSamples(edge.Caller, edge.Callee, edge.SamplesCount, intervalForWindow);
 
-                var lines = new List<string>();
-                lines.Add("");
-                lines.Add($"== {DateTime.Now:HH:mm:ss} | cumulative (processed last {windowSec}s) ==");
-                if (window.MatchedSamples == 0)
-                {
-                    lines.Add($"(no samples matched namespaces/modules [{string.Join(", ", Filters)}])");
-                    if (window.Examples.Count > 0)
-                    {
-                        lines.Add("example frames observed (unfiltered):");
-                        foreach (var ex in window.Examples.Take(8))
-                            lines.Add("  - " + ex);
-                    }
-                }
-                else
-                {
-                    int width = Console.WindowWidth > 0 ? Console.WindowWidth : 120;
-                    lines.Add($"(inclusive: parent counts/time include children; interval≈{LastAvgSampleIntervalMs:F3} ms)");
-                    lines.Add($"{"Samples",9} {"CPU-ms",12} {"Percent",8}  Method (inclusive)");
-                    foreach (var node in Graph.Nodes.Values.OrderByDescending(n => n.InclusiveSamplesCount).Take(topN))
-                    {
-                        double pct = (Graph.TotalCpuMsSum > 0) ? (100.0 * node.CpuMs / Graph.TotalCpuMsSum) : 0.0;
-                        lines.Add($"{node.InclusiveSamplesCount,9} {node.CpuMs,12:F1} {pct,7:F1}%  {Truncate(node.Name, width - 37)}");
-                    }
-                    lines.Add($"-- window stats: matched {window.MatchedSamples} of {window.TotalSamples} samples (this window)");
-
-                    if (Graph.Edges.Count > 0)
-                    {
-                        lines.Add("");
-                        lines.Add("Top call edges (caller -> callee), inclusive samples");
-                        lines.Add($"{"Samples",9} {"CPU-ms",12} {"Percent",8}  Edge");
-                        foreach (var edge in Graph.Edges.Values.OrderByDescending(e => e.SamplesCount).Take(Math.Min(topN, 40)))
-                        {
-                            var edgeLabel = $"{Truncate(edge.Caller, (width - 40) / 2)} -> {Truncate(edge.Callee, (width - 40) / 2)}";
-                            double pct = (Graph.TotalEdgeCpuMsSum > 0) ? (100.0 * edge.CpuMs / Graph.TotalEdgeCpuMsSum) : 0.0;
-                            lines.Add($"{edge.SamplesCount,9} {edge.CpuMs,12:F1} {pct,7:F1}%  {Truncate(edgeLabel, width - 37)}");
-                        }
-                    }
-                }
-                BufferedRender(lines);
+                RenderSpectre(pid, windowSec, topN, window);
             }
             catch (Exception ex)
             {
@@ -117,12 +76,58 @@ class Program
                 {
                     Graph.Clear();
                     LastAvgSampleIntervalMs = 0;
-                    ForceFullRedraw();
+                    AnsiConsole.Clear();
                 }
             }
         }
         return 0;
     }
+
+    private static void RenderSpectre(int pid, int windowSec, int topN, WindowAggregationResult window)
+    {
+        AnsiConsole.Cursor.Hide();
+        AnsiConsole.Clear();
+        var filterEsc = Escape(string.Join(", ", Filters));
+        var header = new Rule($"PID={pid} | Window={windowSec}s | Top={topN} | Filters={filterEsc}") { Justification = Justify.Left };
+        AnsiConsole.Write(header);
+        AnsiConsole.MarkupLine($"[dim]Updated @ {DateTime.Now:HH:mm:ss}[/]");
+
+        if (window.MatchedSamples == 0)
+        {
+            AnsiConsole.MarkupLine($"[yellow]No samples matched filters[/] {filterEsc}");
+            if (window.Examples.Count > 0)
+            {
+                var eg = new Table().Border(TableBorder.Rounded).AddColumn("Example frames (unfiltered)");
+                foreach (var ex in window.Examples.Take(8))
+                    eg.AddRow(Escape(ex));
+                AnsiConsole.Write(eg);
+            }
+            return;
+        }
+
+        AnsiConsole.MarkupLine($"[grey](inclusive: parent counts include children; interval≈{LastAvgSampleIntervalMs:F3} ms)[/]");
+
+        var nodeTable = new Table().Border(TableBorder.SimpleHeavy);
+        nodeTable.AddColumn("Samples");
+        nodeTable.AddColumn("CPU-ms");
+        nodeTable.AddColumn("Percent");
+        nodeTable.AddColumn("Method (inclusive)");
+
+        foreach (var node in Graph.Nodes.Values.OrderByDescending(n => n.InclusiveSamplesCount).Take(topN))
+        {
+            double pct = (Graph.TotalCpuMsSum > 0) ? (100.0 * node.CpuMs / Graph.TotalCpuMsSum) : 0.0;
+            nodeTable.AddRow(node.InclusiveSamplesCount.ToString(), node.CpuMs.ToString("F1"), pct.ToString("F1") + "%", Escape(node.Name));
+        }
+        AnsiConsole.Write(nodeTable);
+
+        AnsiConsole.MarkupLine($"[dim]Window stats: matched {window.MatchedSamples} of {window.TotalSamples} samples[/]");
+
+        AnsiConsole.MarkupLine("[dim]Press 'C' to clear cumulative data. Ctrl+C to exit.[/]");
+        AnsiConsole.Cursor.Show();
+    }
+
+    private static string Escape(string? v)
+        => string.IsNullOrEmpty(v) ? string.Empty : v.Replace("[", "[[").Replace("]", "]]");
 
     static string CollectWindow(int pid, int seconds, bool requestRundown)
     {
@@ -265,59 +270,6 @@ class Program
     {
         try { if (!string.IsNullOrEmpty(path) && File.Exists(path)) File.Delete(path); }
         catch { /* ignore */ }
-    }
-
-    private static int _lastLineCount = 0;
-    private static bool _fullScreenInitialized = false;
-
-    private static void TryInitFullScreen()
-    {
-        if (_fullScreenInitialized) return;
-        try
-        {
-            Console.Write("\x1b[2J\x1b[H");
-            _fullScreenInitialized = true;
-        }
-        catch
-        {
-            try { Console.Clear(); _fullScreenInitialized = true; } catch { }
-        }
-    }
-
-    private static void BufferedRender(List<string> lines)
-    {
-        int width;
-        try { width = Console.WindowWidth > 0 ? Console.WindowWidth : 120; }
-        catch { width = 120; }
-
-        try { Console.SetCursorPosition(0, 0); } catch { TryInitFullScreen(); }
-
-        Console.Write("\x1b[?25l");
-        foreach (var line in lines)
-        {
-            var txt = line ?? string.Empty;
-            if (txt.Length > width - 1)
-                txt = txt.Substring(0, Math.Max(0, width - 2)) + '…';
-            if (txt.Length < width - 1)
-                txt = txt + new string(' ', width - 1 - txt.Length);
-            Console.Write(txt);
-            Console.WriteLine();
-        }
-        for (int i = lines.Count; i < _lastLineCount; i++)
-        {
-            Console.Write(new string(' ', Math.Max(1, width - 1)));
-            Console.WriteLine();
-        }
-        _lastLineCount = lines.Count;
-        try { Console.SetCursorPosition(0, 0); } catch { }
-        Console.Write("\x1b[?25h");
-    }
-
-    private static void ForceFullRedraw()
-    {
-        _lastLineCount = 0;
-        _fullScreenInitialized = false;
-        TryInitFullScreen();
     }
 }
 

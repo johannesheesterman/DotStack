@@ -58,14 +58,14 @@ class Program
                     nodes = nodes.Where(n => MatchesNameOnly(n.Name));
                 IEnumerable<CallGraphEdge> edges = window.Edges.Values;
                 if (Filters.Length > 0)
-                    edges = edges.Where(e => MatchesNameOnly(e.Caller) || MatchesNameOnly(e.Callee));
+                    edges = edges.Where(e => MatchesNameOnly(e.Caller.Name) || MatchesNameOnly(e.Callee.Name));
 
                 lock (_lock)
                 {
                     foreach (var n in nodes)
                         Graph.AddNodeSamples(n.Name, n.InclusiveSamplesCount, intervalMs);
                     foreach (var e in edges)
-                        Graph.AddEdgeSamples(e.Caller, e.Callee, e.SamplesCount, intervalMs);
+                        Graph.AddEdgeSamples(e.Caller.Name, e.Callee.Name, e.SamplesCount, intervalMs);
                     _rows = BuildRows(topNLeaves);
                     _dirty = true;
                 }
@@ -226,9 +226,10 @@ class Program
         var parentsByCallee = new Dictionary<string, List<CallGraphNode>>();
         foreach (var e in Graph.Edges.Values)
         {
-            if (!Graph.Nodes.TryGetValue(e.Caller, out var caller) || !Graph.Nodes.TryGetValue(e.Callee, out var callee)) continue;
-            outgoing.Add(e.Caller);
-            if (!parentsByCallee.TryGetValue(e.Callee, out var plist)) parentsByCallee[e.Callee] = plist = new();
+            var caller = e.Caller;
+            var callee = e.Callee;
+            outgoing.Add(caller.Name);
+            if (!parentsByCallee.TryGetValue(callee.Name, out var plist)) parentsByCallee[callee.Name] = plist = new();
             if (!plist.Contains(caller)) plist.Add(caller);
         }
 
@@ -254,10 +255,11 @@ class Program
         var incoming = new HashSet<string>();
         foreach (var e in Graph.Edges.Values)
         {
-            if (!Graph.Nodes.TryGetValue(e.Caller, out var caller) || !Graph.Nodes.TryGetValue(e.Callee, out var callee)) continue;
-            if (!outgoing.TryGetValue(e.Caller, out var list)) outgoing[e.Caller] = list = new();
+            var caller = e.Caller;
+            var callee = e.Callee;
+            if (!outgoing.TryGetValue(caller.Name, out var list)) outgoing[caller.Name] = list = new();
             list.Add((e, callee));
-            incoming.Add(e.Callee);
+            incoming.Add(callee.Name);
         }
 
         IEnumerable<CallGraphNode> rootQuery = Graph.Nodes.Values.Where(n => !incoming.Contains(n.Name))
@@ -407,9 +409,15 @@ class Program
                     {
                         var edgeKey = (Caller: chosen, Callee: calleeBelow);
                         if (edgeCounts.TryGetValue(edgeKey, out var edgeObj))
+                        {
                             edgeObj.SamplesCount++;
+                        }
                         else
-                            edgeCounts[edgeKey] = new CallGraphEdge(edgeKey.Caller, edgeKey.Callee, 1);
+                        {
+                            var callerNode = counts[chosen];
+                            var calleeNode = counts[calleeBelow];
+                            edgeCounts[edgeKey] = new CallGraphEdge(callerNode, calleeNode, 1);
+                        }
                     }
                 }
                 calleeBelow = chosen;
@@ -491,11 +499,11 @@ internal sealed class CallGraphNode
 
 internal sealed class CallGraphEdge
 {
-    public string Caller { get; }
-    public string Callee { get; }
+    public CallGraphNode Caller { get; }
+    public CallGraphNode Callee { get; }
     public long SamplesCount { get; set; }
     public double CpuMs { get; set; }
-    public CallGraphEdge(string caller, string callee, long samples)
+    public CallGraphEdge(CallGraphNode caller, CallGraphNode callee, long samples)
     {
         Caller = caller;
         Callee = callee;
@@ -531,7 +539,7 @@ internal sealed class WeightedCallGraph
     public double TotalCpuMsSum { get; private set; }
     public double TotalEdgeCpuMsSum { get; private set; }
 
-    public void AddNodeSamples(string name, long samples, double intervalMs)
+    public CallGraphNode AddNodeSamples(string name, long samples, double intervalMs)
     {
         if (!Nodes.TryGetValue(name, out var node))
         {
@@ -542,11 +550,15 @@ internal sealed class WeightedCallGraph
         double addMs = samples * intervalMs;
         node.CpuMs += addMs;
         TotalCpuMsSum += addMs;
+        return node;
     }
 
-    public void AddEdgeSamples(string caller, string callee, long samples, double intervalMs)
+    public void AddEdgeSamples(string callerName, string calleeName, long samples, double intervalMs)
     {
-        var key = (Caller: caller, Callee: callee);
+        // Ensure node objects exist (and are reused) before creating edge.
+        var caller = AddNodeSamples(callerName, 0, 0); // 0 additional samples here
+        var callee = AddNodeSamples(calleeName, 0, 0);
+        var key = (Caller: callerName, Callee: calleeName);
         if (!Edges.TryGetValue(key, out var edge))
         {
             edge = new CallGraphEdge(caller, callee, 0);

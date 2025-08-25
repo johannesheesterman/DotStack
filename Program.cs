@@ -19,7 +19,6 @@ class Program
     private static readonly object _lock = new();
     private static volatile List<DisplayRow> _rows = new();
     private static volatile bool _dirty = true;
-    // View mode removed: single unified view (nodes sorted by samples with their callees)
     private static readonly HashSet<string> _collapsed = new(StringComparer.Ordinal);
     private const int ConsoleOverheadRows = 7; // header + help + footer spacing
     private static double Percent(double cpuMs) => Graph.TotalCpuMsSum > 0 ? 100.0 * cpuMs / Graph.TotalCpuMsSum : 0.0;
@@ -247,7 +246,7 @@ class Program
             {
                 marker = _collapsed.Contains(row.Name) ? "+ " : "- ";
             }
-            var bullet = row.Depth > 0 ? string.Empty : string.Empty; // marker replaces bullet
+            var bullet = row.Depth > 0 ? string.Empty : string.Empty;
             var plainLabel = indent + marker + bullet + row.Name;
             if (plainLabel.Length > methodWidth)
                 plainLabel = plainLabel[..Math.Max(0, methodWidth - 1)] + "…";
@@ -286,19 +285,22 @@ class Program
             if (!outgoing.TryGetValue(e.Caller.Name, out var list)) outgoing[e.Caller.Name] = list = new();
             list.Add((e, e.Callee));
         }
-        IEnumerable<CallGraphNode> roots = Graph.Nodes.Values
+        IEnumerable<CallGraphNode> rootCandidates = Graph.Nodes.Values
             .OrderByDescending(n => n.InclusiveSamplesCount)
             .ThenBy(n => n.Name, StringComparer.Ordinal);
-        if (topN > 0) roots = roots.Take(topN);
-        foreach (var root in roots)
+        if (topN > 0) rootCandidates = rootCandidates.Take(topN);
+        var displayed = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var root in rootCandidates)
         {
-            TraverseCallees(root, null, 0, new HashSet<string>(), rows, outgoing, 128);
+            if (displayed.Contains(root.Name))
+                continue;
+            TraverseCallees(root, null, 0, new HashSet<string>(), rows, outgoing, 128, displayed);
         }
         return rows;
     }
 
     private static void TraverseCallees(CallGraphNode node, CallGraphEdge? incomingEdge, int depth, HashSet<string> path, List<DisplayRow> rows,
-        Dictionary<string, List<(CallGraphEdge edge, CallGraphNode callee)>> outgoing, int depthLimit)
+        Dictionary<string, List<(CallGraphEdge edge, CallGraphNode callee)>> outgoing, int depthLimit, HashSet<string> displayed)
     {
         if (depth > depthLimit) return;
         bool cycle = path.Contains(node.Name);
@@ -307,6 +309,7 @@ class Program
         bool hasChildren = !cycle && outgoing.TryGetValue(node.Name, out var childList) && childList.Count > 0;
         rows.Add(new DisplayRow(cycle ? node.Name + " (cycle)" : node.Name, samplesDisplay, cpuMsDisplay, Percent(cpuMsDisplay), depth, hasChildren));
         if (cycle) return;
+        displayed.Add(node.Name);
         path.Add(node.Name);
         if (!_collapsed.Contains(node.Name) && outgoing.TryGetValue(node.Name, out var children))
         {
@@ -314,7 +317,7 @@ class Program
                 .OrderByDescending(c => c.edge.SamplesCount)
                 .ThenBy(c => c.callee.Name, StringComparer.Ordinal))
             {
-                TraverseCallees(child.callee, child.edge, depth + 1, path, rows, outgoing, depthLimit);
+                TraverseCallees(child.callee, child.edge, depth + 1, path, rows, outgoing, depthLimit, displayed);
             }
         }
         path.Remove(node.Name);
@@ -592,5 +595,3 @@ internal sealed class WeightedCallGraph
         TotalEdgeCpuMsSum = 0;
     }
 }
-
-// (Removed ViewMode enum)

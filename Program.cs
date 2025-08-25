@@ -25,11 +25,11 @@ class Program
     {
         if (args.Length < 1 || !int.TryParse(args[0], out var pid))
         {
-            Console.WriteLine("Usage: HotMethodsCumulative <pid> [windowSec=2] [topNLeaves=50] [filters=foo,bar]");
+            Console.WriteLine("Usage: HotMethodsCumulative <pid> [windowSec=2] [topN=50|0=all] [filters=foo,bar]");
             return 1;
         }
         int windowSec = args.Length >= 2 && int.TryParse(args[1], out var w) ? Math.Max(1, w) : 2;
-        int topNLeaves = args.Length >= 3 && int.TryParse(args[2], out var t) ? Math.Max(1, t) : 50;
+        int topNLeaves = args.Length >= 3 && int.TryParse(args[2], out var t) ? t : 50; // t <=0 means unlimited
         if (args.Length >= 4 && !string.IsNullOrWhiteSpace(args[3]))
             Filters = args[3].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
@@ -172,7 +172,8 @@ class Program
         AnsiConsole.Clear();
         var filterEsc = Escape(string.Join(", ", Filters));
     var modeLabel = _viewMode == ViewMode.BottomUp ? "BottomUp" : "TopDown";
-    var header = new Rule($"PID={pid} | Window={windowSec}s | TopN={topNLeaves} | Filters={filterEsc} | View={modeLabel}") { Justification = Justify.Left };
+    var topLabel = topNLeaves <= 0 ? "All" : topNLeaves.ToString();
+    var header = new Rule($"PID={pid} | Window={windowSec}s | TopN={topLabel} | Filters={filterEsc} | View={modeLabel}") { Justification = Justify.Left };
         AnsiConsole.Write(header);
         AnsiConsole.MarkupLine($"[dim]Updated @ {DateTime.Now:HH:mm:ss} | interval≈{LastAvgSampleIntervalMs:F3} ms | Rows={rows.Count}[/]");
     AnsiConsole.MarkupLine("[grey]Use ↑↓ PgUp PgDn Home End, 'C' clear, 'T' toggle view, Ctrl+C exit[/]");
@@ -188,6 +189,13 @@ class Program
             int idx = rows.IndexOf(row); // acceptable for limited visible range
             var styleStart = idx == selected ? "[black on yellow]" : string.Empty;
             var styleEnd = idx == selected ? "[/]" : string.Empty;
+            if (string.IsNullOrEmpty(row.Name))
+            {
+                // Separator row
+                var sep = new string('─', Math.Clamp(methodWidth, 3, 60));
+                table.AddRow("", "", "", styleStart + "[dim]" + sep + "[/]" + styleEnd);
+                continue;
+            }
             var indent = new string(' ', row.Depth * 2);
             var bullet = row.Depth > 0 ? "• " : string.Empty;
             var plainLabel = indent + bullet + row.Name;
@@ -214,45 +222,27 @@ class Program
     private static List<DisplayRow> BuildFlattenedBottomUp(int topNLeaves)
     {
         var rows = new List<DisplayRow>();
-        var outgoing = new Dictionary<string, List<(CallGraphEdge edge, CallGraphNode callee)>>();
-        var incoming = new Dictionary<string, List<(CallGraphEdge edge, CallGraphNode caller)>>();
+        var outgoing = new HashSet<string>(); 
+        var parentsByCallee = new Dictionary<string, List<CallGraphNode>>();
         foreach (var e in Graph.Edges.Values)
         {
             if (!Graph.Nodes.TryGetValue(e.Caller, out var caller) || !Graph.Nodes.TryGetValue(e.Callee, out var callee)) continue;
-            if (!outgoing.TryGetValue(e.Caller, out var outList)) outgoing[e.Caller] = outList = new();
-            outList.Add((e, callee));
-            if (!incoming.TryGetValue(e.Callee, out var inList)) incoming[e.Callee] = inList = new();
-            inList.Add((e, caller));
+            outgoing.Add(e.Caller);
+            if (!parentsByCallee.TryGetValue(e.Callee, out var plist)) parentsByCallee[e.Callee] = plist = new();
+            if (!plist.Contains(caller)) plist.Add(caller);
         }
-        var leaves = Graph.Nodes.Values.Where(n => !outgoing.ContainsKey(n.Name))
-            .OrderByDescending(n => n.InclusiveSamplesCount)
-            .Take(topNLeaves)
-            .ToList();
-        var printed = new HashSet<string>();
+
+        IEnumerable<CallGraphNode> leafQuery = Graph.Nodes.Values.Where(n => !outgoing.Contains(n.Name))
+            .OrderByDescending(n => n.InclusiveSamplesCount);
+        if (topNLeaves > 0)
+            leafQuery = leafQuery.Take(topNLeaves);
+        var leaves = leafQuery.ToList();
+
         foreach (var leaf in leaves)
         {
-            var path = new List<CallGraphNode>();
-            var current = leaf; int guard = 0;
-            while (current != null && guard++ < 256)
-            {
-                path.Add(current);
-                if (!incoming.TryGetValue(current.Name, out var parents) || parents.Count == 0) break;
-                var chosen = parents
-                    .OrderByDescending(p => p.caller.InclusiveSamplesCount)
-                    .ThenByDescending(p => p.edge.SamplesCount)
-                    .First().caller;
-                if (path.Any(p => p.Name == chosen.Name)) break;
-                current = chosen;
-            }
-            path.Reverse();
-            for (int depth = 0; depth < path.Count; depth++)
-            {
-                var node = path[depth];
-                if (printed.Contains(node.Name)) continue;
-                printed.Add(node.Name);
-                double pct = (Graph.TotalCpuMsSum > 0) ? (100.0 * node.CpuMs / Graph.TotalCpuMsSum) : 0.0;
-                rows.Add(new DisplayRow(node.Name, node.InclusiveSamplesCount, node.CpuMs, pct, depth));
-            }
+            double leafPct = (Graph.TotalCpuMsSum > 0) ? (100.0 * leaf.CpuMs / Graph.TotalCpuMsSum) : 0.0;
+            rows.Add(new DisplayRow(leaf.Name, leaf.InclusiveSamplesCount, leaf.CpuMs, leafPct, 0));
+            ExpandParents(leaf.Name, parentsByCallee, new HashSet<string> { leaf.Name }, rows, 1, depthLimit: 128);
         }
         return rows;
     }
@@ -270,36 +260,59 @@ class Program
             incoming.Add(e.Callee);
         }
 
-        var roots = Graph.Nodes.Values.Where(n => !incoming.Contains(n.Name))
-            .OrderByDescending(n => n.InclusiveSamplesCount)
-            .Take(topN)
-            .ToList();
+        IEnumerable<CallGraphNode> rootQuery = Graph.Nodes.Values.Where(n => !incoming.Contains(n.Name))
+            .OrderByDescending(n => n.InclusiveSamplesCount);
+        if (topN > 0)
+            rootQuery = rootQuery.Take(topN);
+        var roots = rootQuery.ToList();
         if (roots.Count == 0)
         {
-            roots = Graph.Nodes.Values.OrderByDescending(n => n.InclusiveSamplesCount).Take(topN).ToList();
+            IEnumerable<CallGraphNode> fallback = Graph.Nodes.Values.OrderByDescending(n => n.InclusiveSamplesCount);
+            if (topN > 0) fallback = fallback.Take(topN);
+            roots = fallback.ToList();
         }
-        var printed = new HashSet<string>();
         foreach (var root in roots)
         {
-            Traverse(root, 0, printed, rows, outgoing, depthLimit: 128);
+            TraverseFull(root, 0, new HashSet<string>(), rows, outgoing, depthLimit: 128);
         }
         return rows;
     }
 
-    private static void Traverse(CallGraphNode node, int depth, HashSet<string> printed, List<DisplayRow> rows,
+    private static void TraverseFull(CallGraphNode node, int depth, HashSet<string> path, List<DisplayRow> rows,
         Dictionary<string, List<(CallGraphEdge edge, CallGraphNode callee)>> outgoing, int depthLimit)
     {
         if (depth > depthLimit) return;
-        if (printed.Contains(node.Name)) return; // avoid repetition & cycles
-        printed.Add(node.Name);
+        bool cycle = path.Contains(node.Name);
         double pct = (Graph.TotalCpuMsSum > 0) ? (100.0 * node.CpuMs / Graph.TotalCpuMsSum) : 0.0;
-        rows.Add(new DisplayRow(node.Name, node.InclusiveSamplesCount, node.CpuMs, pct, depth));
-        if (!outgoing.TryGetValue(node.Name, out var children)) return;
-        foreach (var child in children
-            .OrderByDescending(c => c.callee.InclusiveSamplesCount)
-            .ThenByDescending(c => c.edge.SamplesCount))
+        rows.Add(new DisplayRow(cycle ? node.Name + " (cycle)" : node.Name, node.InclusiveSamplesCount, node.CpuMs, pct, depth));
+        if (cycle) return;
+        path.Add(node.Name);
+        if (outgoing.TryGetValue(node.Name, out var children))
         {
-            Traverse(child.callee, depth + 1, printed, rows, outgoing, depthLimit);
+            foreach (var child in children
+                .OrderByDescending(c => c.callee.InclusiveSamplesCount)
+                .ThenByDescending(c => c.edge.SamplesCount))
+            {
+                TraverseFull(child.callee, depth + 1, path, rows, outgoing, depthLimit);
+            }
+        }
+        path.Remove(node.Name);
+    }
+
+    private static void ExpandParents(string calleeName, Dictionary<string, List<CallGraphNode>> parentsByCallee,
+        HashSet<string> path, List<DisplayRow> rows, int depth, int depthLimit)
+    {
+        if (depth > depthLimit) return;
+        if (!parentsByCallee.TryGetValue(calleeName, out var parents)) return;
+        foreach (var parent in parents.OrderByDescending(p => p.InclusiveSamplesCount))
+        {
+            bool cycle = path.Contains(parent.Name);
+            double pct = (Graph.TotalCpuMsSum > 0) ? (100.0 * parent.CpuMs / Graph.TotalCpuMsSum) : 0.0;
+            rows.Add(new DisplayRow(cycle ? parent.Name + " (cycle)" : parent.Name, parent.InclusiveSamplesCount, parent.CpuMs, pct, depth));
+            if (cycle) continue;
+            path.Add(parent.Name);
+            ExpandParents(parent.Name, parentsByCallee, path, rows, depth + 1, depthLimit);
+            path.Remove(parent.Name);
         }
     }
 
@@ -453,12 +466,6 @@ class Program
                 return true;
         }
         return false;
-    }
-
-    static string Truncate(string? s, int max)
-    {
-        if (string.IsNullOrEmpty(s)) return string.Empty;
-        return s.Length <= max ? s : s.Substring(0, Math.Max(0, max - 1)) + "…";
     }
 
     static void TryDelete(string? path)

@@ -20,6 +20,9 @@ class Program
     private static volatile List<DisplayRow> _rows = new();
     private static volatile bool _dirty = true;
     private static volatile ViewMode _viewMode = ViewMode.BottomUp;
+    private const int ConsoleOverheadRows = 7; // header + help + footer spacing
+    private static double Percent(double cpuMs) => Graph.TotalCpuMsSum > 0 ? 100.0 * cpuMs / Graph.TotalCpuMsSum : 0.0;
+    private static bool IsFilteredName(string name) => Filters.Length == 0 || Filters.Any(f => !string.IsNullOrEmpty(f) && name.IndexOf(f, StringComparison.OrdinalIgnoreCase) >= 0);
 
     static int Main(string[] args)
     {
@@ -55,10 +58,10 @@ class Program
 
                 IEnumerable<CallGraphNode> nodes = window.Nodes.Values;
                 if (Filters.Length > 0)
-                    nodes = nodes.Where(n => MatchesNameOnly(n.Name));
+                    nodes = nodes.Where(n => IsFilteredName(n.Name));
                 IEnumerable<CallGraphEdge> edges = window.Edges.Values;
                 if (Filters.Length > 0)
-                    edges = edges.Where(e => MatchesNameOnly(e.Caller.Name) || MatchesNameOnly(e.Callee.Name));
+                    edges = edges.Where(e => IsFilteredName(e.Caller.Name) || IsFilteredName(e.Callee.Name));
 
                 lock (_lock)
                 {
@@ -151,17 +154,15 @@ class Program
     private static void EnsureScroll(ref int scroll, int selected, int total)
     {
         int usable = GetUsableRows();
+        scroll = Math.Clamp(scroll, 0, Math.Max(0, total - usable));
         if (selected < scroll) scroll = selected;
-        if (selected >= scroll + usable) scroll = Math.Max(0, selected - usable + 1);
-        scroll = Math.Min(scroll, Math.Max(0, Math.Max(0, total - usable)));
+        else if (selected >= scroll + usable) scroll = Math.Max(0, selected - usable + 1);
     }
 
     private static int GetUsableRows()
     {
         int h; try { h = Console.WindowHeight; } catch { h = 40; }
-        int baseOverhead = 1 + 1 + 1 + 2 + 1 + 1; // =7
-        int overhead = baseOverhead;
-        int usable = h - overhead;
+        int usable = h - ConsoleOverheadRows;
         if (usable < 5) usable = 5;
         return usable;
     }
@@ -171,42 +172,43 @@ class Program
         AnsiConsole.Cursor.Hide();
         AnsiConsole.Clear();
         var filterEsc = Escape(string.Join(", ", Filters));
-    var modeLabel = _viewMode == ViewMode.BottomUp ? "BottomUp" : "TopDown";
-    var topLabel = topNLeaves <= 0 ? "All" : topNLeaves.ToString();
-    var header = new Rule($"PID={pid} | Window={windowSec}s | TopN={topLabel} | Filters={filterEsc} | View={modeLabel}") { Justification = Justify.Left };
+        var modeLabel = _viewMode == ViewMode.BottomUp ? "BottomUp" : "TopDown";
+        var topLabel = topNLeaves <= 0 ? "All" : topNLeaves.ToString();
+        var header = new Rule($"PID={pid} | Window={windowSec}s | TopN={topLabel} | Filters={filterEsc} | View={modeLabel}") { Justification = Justify.Left };
         AnsiConsole.Write(header);
         AnsiConsole.MarkupLine($"[dim]Updated @ {DateTime.Now:HH:mm:ss} | interval≈{LastAvgSampleIntervalMs:F3} ms | Rows={rows.Count}[/]");
-    AnsiConsole.MarkupLine("[grey]Use ↑↓ PgUp PgDn Home End, 'C' clear, 'T' toggle view, Ctrl+C exit[/]");
-    int usable = GetUsableRows();
-        var table = new Table().Border(TableBorder.SimpleHeavy);
-        table.AddColumn("Samples");
-        table.AddColumn("CPU-ms");
-        table.AddColumn("Percent");
-        table.AddColumn("Call Tree (hot leaves)");
+        AnsiConsole.MarkupLine("[grey]Use ↑↓ PgUp PgDn Home End, 'C' clear, 'T' toggle view, Ctrl+C exit[/]");
+        int usable = GetUsableRows();
+        var table = new Table().Border(TableBorder.SimpleHeavy)
+            .AddColumn("Samples")
+            .AddColumn("CPU-ms")
+            .AddColumn("Percent")
+            .AddColumn("Call Tree (hot leaves)");
         int methodWidth = GetMethodColumnWidth();
-        foreach (var row in rows.Skip(scroll).Take(usable))
+        var visible = rows.Skip(scroll).Take(usable).ToList();
+        for (int i = 0; i < visible.Count; i++)
         {
-            int idx = rows.IndexOf(row); // acceptable for limited visible range
-            var styleStart = idx == selected ? "[black on yellow]" : string.Empty;
-            var styleEnd = idx == selected ? "[/]" : string.Empty;
+            var row = visible[i];
+            int idx = scroll + i;
+            bool isSel = idx == selected;
+            string Wrap(string s) => isSel ? "[black on yellow]" + s + "[/]" : s;
             if (string.IsNullOrEmpty(row.Name))
             {
-                // Separator row
                 var sep = new string('─', Math.Clamp(methodWidth, 3, 60));
-                table.AddRow("", "", "", styleStart + "[dim]" + sep + "[/]" + styleEnd);
+                table.AddRow("", "", "", Wrap("[dim]" + sep + "[/]"));
                 continue;
             }
             var indent = new string(' ', row.Depth * 2);
             var bullet = row.Depth > 0 ? "• " : string.Empty;
             var plainLabel = indent + bullet + row.Name;
             if (plainLabel.Length > methodWidth)
-                plainLabel = plainLabel.Substring(0, Math.Max(0, methodWidth - 1)) + "…";
+                plainLabel = plainLabel[..Math.Max(0, methodWidth - 1)] + "…";
             var label = Escape(plainLabel);
             table.AddRow(
-                styleStart + row.Samples.ToString() + styleEnd,
-                styleStart + row.CpuMs.ToString("F1") + styleEnd,
-                styleStart + row.Percent.ToString("F1") + "%" + styleEnd,
-                styleStart + label + styleEnd
+                Wrap(row.Samples.ToString()),
+                Wrap(row.CpuMs.ToString("F1")),
+                Wrap(row.Percent.ToString("F1") + "%"),
+                Wrap(label)
             );
         }
         AnsiConsole.Write(table);
@@ -222,28 +224,39 @@ class Program
     private static List<DisplayRow> BuildFlattenedBottomUp(int topNLeaves)
     {
         var rows = new List<DisplayRow>();
-        var outgoing = new HashSet<string>(); 
-        var parentsByCallee = new Dictionary<string, List<CallGraphNode>>();
+        var parentsByCallee = new Dictionary<string, HashSet<CallGraphNode>>();
+        var hasOutgoing = new HashSet<string>();
         foreach (var e in Graph.Edges.Values)
         {
-            var caller = e.Caller;
-            var callee = e.Callee;
-            outgoing.Add(caller.Name);
-            if (!parentsByCallee.TryGetValue(callee.Name, out var plist)) parentsByCallee[callee.Name] = plist = new();
-            if (!plist.Contains(caller)) plist.Add(caller);
+            hasOutgoing.Add(e.Caller.Name);
+            if (!parentsByCallee.TryGetValue(e.Callee.Name, out var set)) parentsByCallee[e.Callee.Name] = set = new();
+            set.Add(e.Caller);
         }
+        var leavesSeq = Graph.Nodes.Values.Where(n => !hasOutgoing.Contains(n.Name))
+            .OrderByDescending(n => n.InclusiveSamplesCount)
+            .AsEnumerable();
+        if (topNLeaves > 0) leavesSeq = leavesSeq.Take(topNLeaves);
+        var leaves = leavesSeq.ToList();
 
-        IEnumerable<CallGraphNode> leafQuery = Graph.Nodes.Values.Where(n => !outgoing.Contains(n.Name))
-            .OrderByDescending(n => n.InclusiveSamplesCount);
-        if (topNLeaves > 0)
-            leafQuery = leafQuery.Take(topNLeaves);
-        var leaves = leafQuery.ToList();
+        void Recurse(string calleeName, HashSet<string> path, int depth)
+        {
+            if (depth > 128) return;
+            if (!parentsByCallee.TryGetValue(calleeName, out var parents)) return;
+            foreach (var parent in parents.OrderByDescending(p => p.InclusiveSamplesCount))
+            {
+                bool cycle = path.Contains(parent.Name);
+                rows.Add(new DisplayRow(cycle ? parent.Name + " (cycle)" : parent.Name, parent.InclusiveSamplesCount, parent.CpuMs, Percent(parent.CpuMs), depth));
+                if (cycle) continue;
+                path.Add(parent.Name);
+                Recurse(parent.Name, path, depth + 1);
+                path.Remove(parent.Name);
+            }
+        }
 
         foreach (var leaf in leaves)
         {
-            double leafPct = (Graph.TotalCpuMsSum > 0) ? (100.0 * leaf.CpuMs / Graph.TotalCpuMsSum) : 0.0;
-            rows.Add(new DisplayRow(leaf.Name, leaf.InclusiveSamplesCount, leaf.CpuMs, leafPct, 0));
-            ExpandParents(leaf.Name, parentsByCallee, new HashSet<string> { leaf.Name }, rows, 1, depthLimit: 128);
+            rows.Add(new DisplayRow(leaf.Name, leaf.InclusiveSamplesCount, leaf.CpuMs, Percent(leaf.CpuMs), 0));
+            Recurse(leaf.Name, new HashSet<string> { leaf.Name }, 1);
         }
         return rows;
     }
@@ -285,8 +298,7 @@ class Program
     {
         if (depth > depthLimit) return;
         bool cycle = path.Contains(node.Name);
-        double pct = (Graph.TotalCpuMsSum > 0) ? (100.0 * node.CpuMs / Graph.TotalCpuMsSum) : 0.0;
-        rows.Add(new DisplayRow(cycle ? node.Name + " (cycle)" : node.Name, node.InclusiveSamplesCount, node.CpuMs, pct, depth));
+        rows.Add(new DisplayRow(cycle ? node.Name + " (cycle)" : node.Name, node.InclusiveSamplesCount, node.CpuMs, Percent(node.CpuMs), depth));
         if (cycle) return;
         path.Add(node.Name);
         if (outgoing.TryGetValue(node.Name, out var children))
@@ -299,23 +311,6 @@ class Program
             }
         }
         path.Remove(node.Name);
-    }
-
-    private static void ExpandParents(string calleeName, Dictionary<string, List<CallGraphNode>> parentsByCallee,
-        HashSet<string> path, List<DisplayRow> rows, int depth, int depthLimit)
-    {
-        if (depth > depthLimit) return;
-        if (!parentsByCallee.TryGetValue(calleeName, out var parents)) return;
-        foreach (var parent in parents.OrderByDescending(p => p.InclusiveSamplesCount))
-        {
-            bool cycle = path.Contains(parent.Name);
-            double pct = (Graph.TotalCpuMsSum > 0) ? (100.0 * parent.CpuMs / Graph.TotalCpuMsSum) : 0.0;
-            rows.Add(new DisplayRow(cycle ? parent.Name + " (cycle)" : parent.Name, parent.InclusiveSamplesCount, parent.CpuMs, pct, depth));
-            if (cycle) continue;
-            path.Add(parent.Name);
-            ExpandParents(parent.Name, parentsByCallee, path, rows, depth + 1, depthLimit);
-            path.Remove(parent.Name);
-        }
     }
 
     private static string Escape(string? v) => string.IsNullOrEmpty(v) ? string.Empty : v.Replace("[", "[[").Replace("]", "]]");
@@ -332,12 +327,6 @@ class Program
         return method;
     }
 
-    private static int InitTableMargin()
-    {
-        var env = Environment.GetEnvironmentVariable("DOTSTACK_TABLE_MARGIN");
-        if (int.TryParse(env, out var m) && m >= 0 && m <= 50) return m;
-        return 3;
-    }
 
     static string CollectWindow(int pid, int seconds, bool requestRundown)
     {
@@ -395,6 +384,7 @@ class Program
                 var full = method?.FullMethodName;
                 var module = method?.MethodModuleFile?.Name;
                 var chosen = full ?? module ?? frame.ToString();
+                chosen = FrameNameUtil.NormalizeFrameName(chosen);
                 if (!string.IsNullOrEmpty(chosen))
                 {
                     if (counts.TryGetValue(chosen, out var existingNode))
@@ -464,17 +454,6 @@ class Program
         return false;
     }
 
-    static bool MatchesNameOnly(string name)
-    {
-        if (Filters.Length == 0) return true;
-        foreach (var f in Filters)
-        {
-            if (string.IsNullOrEmpty(f)) continue;
-            if (name.IndexOf(f, StringComparison.OrdinalIgnoreCase) >= 0)
-                return true;
-        }
-        return false;
-    }
 
     static void TryDelete(string? path)
     {
@@ -482,6 +461,34 @@ class Program
         catch { /* ignore */ }
     }
 }
+
+internal static class FrameNameUtil
+{
+    public static string NormalizeFrameName(string? name)
+    {
+        if (string.IsNullOrEmpty(name)) return string.Empty;
+        var sb = new System.Text.StringBuilder(name.Length);
+        bool lastSpace = false;
+        foreach (var ch in name)
+        {
+            if (char.IsControl(ch) || char.IsWhiteSpace(ch))
+            {
+                if (!lastSpace)
+                {
+                    sb.Append(' ');
+                    lastSpace = true;
+                }
+            }
+            else
+            {
+                sb.Append(ch);
+                lastSpace = false;
+            }
+        }
+        return sb.ToString().Trim();
+    }
+}
+
 
 internal sealed record DisplayRow(string Name, long Samples, double CpuMs, double Percent, int Depth);
 
